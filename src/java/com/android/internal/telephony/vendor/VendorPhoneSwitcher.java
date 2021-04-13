@@ -247,10 +247,6 @@ public class VendorPhoneSwitcher extends PhoneSwitcher {
 
     @Override
     protected boolean onEvaluate(boolean requestsChanged, String reason) {
-        if (!com.android.internal.telephony.SubscriptionInfoUpdater.isSubInfoInitialized()) {
-            log("subscription info isn't initialized yet");
-            return false;
-        }
         StringBuilder sb = new StringBuilder(reason);
 
         boolean diffDetected = requestsChanged;
@@ -273,11 +269,7 @@ public class VendorPhoneSwitcher extends PhoneSwitcher {
         for (int i = 0; i < mActiveModemCount; i++) {
             int sub = mSubscriptionController.getSubIdUsingPhoneId(i);
 
-            if (SubscriptionManager.isValidSubscriptionId(sub) && isSimReady(i)) {
-                hasAnyActiveSubscription = true;
-            } else {
-		log("slot" + i + " not a valid subscription");
-            }
+            if (SubscriptionManager.isValidSubscriptionId(sub)) hasAnyActiveSubscription = true;
 
             if (sub != mPhoneSubscriptions[i]) {
                 sb.append(" phone[").append(i).append("] ").append(mPhoneSubscriptions[i]);

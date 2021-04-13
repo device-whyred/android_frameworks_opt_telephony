@@ -61,7 +61,6 @@ import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * IccSmsInterfaceManager to provide an inter-process communication to
@@ -70,6 +69,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class IccSmsInterfaceManager {
     static final String LOG_TAG = "IccSmsInterfaceManager";
     static final boolean DBG = true;
+
+    @UnsupportedAppUsage
+    protected final Object mLock = new Object();
+    @UnsupportedAppUsage
+    protected boolean mSuccess;
+    @UnsupportedAppUsage
+    private List<SmsRawData> mSms;
+
+    private String mSmsc;
 
     @UnsupportedAppUsage
     private CellBroadcastRangeManager mCellBroadcastRangeManager =
@@ -100,57 +108,63 @@ public class IccSmsInterfaceManager {
 
     private final LocalLog mCellBroadcastLocalLog = new LocalLog(100);
 
-    private static final class Request {
-        AtomicBoolean mStatus = new AtomicBoolean(false);
-        Object mResult = null;
-    }
-
     @UnsupportedAppUsage
     protected Handler mHandler = new Handler() {
         @Override
         public void handleMessage(Message msg) {
-            AsyncResult ar = (AsyncResult) msg.obj;
-            Request request = (Request) ar.userObj;
+            AsyncResult ar;
 
             switch (msg.what) {
                 case EVENT_UPDATE_DONE:
-                case EVENT_SET_BROADCAST_ACTIVATION_DONE:
-                case EVENT_SET_BROADCAST_CONFIG_DONE:
-                case EVENT_SET_SMSC_DONE:
-                    notifyPending(request, ar.exception == null);
+                    ar = (AsyncResult) msg.obj;
+                    synchronized (mLock) {
+                        mSuccess = (ar.exception == null);
+                        mLock.notifyAll();
+                    }
                     break;
                 case EVENT_LOAD_DONE:
-                    List<SmsRawData> smsRawDataList = null;
-                    if (ar.exception == null) {
-                        smsRawDataList = buildValidRawData((ArrayList<byte[]>) ar.result);
-                        //Mark SMS as read after importing it from card.
-                        markMessagesAsRead((ArrayList<byte[]>) ar.result);
-                    } else {
-                        if (Rlog.isLoggable("SMS", Log.DEBUG)) {
-                            loge("Cannot load Sms records");
+                    ar = (AsyncResult)msg.obj;
+                    synchronized (mLock) {
+                        if (ar.exception == null) {
+                            mSms = buildValidRawData((ArrayList<byte[]>) ar.result);
+                            //Mark SMS as read after importing it from card.
+                            markMessagesAsRead((ArrayList<byte[]>) ar.result);
+                        } else {
+                            if (Rlog.isLoggable("SMS", Log.DEBUG)) {
+                                loge("Cannot load Sms records");
+                            }
+                            mSms = null;
                         }
+                        mLock.notifyAll();
                     }
-                    notifyPending(request, smsRawDataList);
+                    break;
+                case EVENT_SET_BROADCAST_ACTIVATION_DONE:
+                case EVENT_SET_BROADCAST_CONFIG_DONE:
+                    ar = (AsyncResult) msg.obj;
+                    synchronized (mLock) {
+                        mSuccess = (ar.exception == null);
+                        mLock.notifyAll();
+                    }
                     break;
                 case EVENT_GET_SMSC_DONE:
-                    String smsc = null;
-                    if (ar.exception == null) {
-                        smsc = (String) ar.result;
-                    } else {
-                        loge("Cannot read SMSC");
+                    ar = (AsyncResult) msg.obj;
+                    synchronized (mLock) {
+                        if (ar.exception == null) {
+                            mSmsc = (String) ar.result;
+                        } else {
+                            loge("Cannot read SMSC");
+                            mSmsc = null;
+                        }
+                        mLock.notifyAll();
                     }
-                    notifyPending(request, smsc);
                     break;
-            }
-        }
-
-        private void notifyPending(Request request, Object result) {
-            if (request != null) {
-                synchronized (request) {
-                    request.mResult = result;
-                    request.mStatus.set(true);
-                    request.notifyAll();
-                }
+                case EVENT_SET_SMSC_DONE:
+                    ar = (AsyncResult) msg.obj;
+                    synchronized (mLock) {
+                        mSuccess = (ar.exception == null);
+                        mLock.notifyAll();
+                    }
+                    break;
             }
         }
     };
@@ -158,21 +172,20 @@ public class IccSmsInterfaceManager {
     protected IccSmsInterfaceManager(Phone phone) {
         this(phone, phone.getContext(),
                 (AppOpsManager) phone.getContext().getSystemService(Context.APP_OPS_SERVICE),
+                (UserManager) phone.getContext().getSystemService(Context.USER_SERVICE),
                 new SmsDispatchersController(
-                        phone, phone.mSmsStorageMonitor, phone.mSmsUsageMonitor),
-                new SmsPermissions(phone, phone.getContext(),
-                        (AppOpsManager) phone.getContext().getSystemService(
-                                Context.APP_OPS_SERVICE)));
+                        phone, phone.mSmsStorageMonitor, phone.mSmsUsageMonitor));
     }
+
     @VisibleForTesting
     public IccSmsInterfaceManager(
-            Phone phone, Context context, AppOpsManager appOps,
-            SmsDispatchersController dispatchersController, SmsPermissions smsPermissions) {
+            Phone phone, Context context, AppOpsManager appOps, UserManager userManager,
+            SmsDispatchersController dispatchersController) {
         mPhone = phone;
         mContext = context;
         mAppOps = appOps;
         mDispatchersController = dispatchersController;
-        mSmsPermissions = smsPermissions;
+        mSmsPermissions = new SmsPermissions(phone, context, appOps);
     }
 
     private void enforceNotOnHandlerThread(String methodName) {
@@ -256,9 +269,9 @@ public class IccSmsInterfaceManager {
                 callingPackage) != AppOpsManager.MODE_ALLOWED) {
             return false;
         }
-        Request updateRequest = new Request();
-        synchronized (updateRequest) {
-            Message response = mHandler.obtainMessage(EVENT_UPDATE_DONE, updateRequest);
+        synchronized(mLock) {
+            mSuccess = false;
+            Message response = mHandler.obtainMessage(EVENT_UPDATE_DONE);
 
             if ((status & 0x01) == STATUS_ON_ICC_FREE) {
                 // RIL_REQUEST_DELETE_SMS_ON_SIM vs RIL_REQUEST_CDMA_DELETE_SMS_ON_RUIM
@@ -275,16 +288,20 @@ public class IccSmsInterfaceManager {
                 IccFileHandler fh = mPhone.getIccFileHandler();
                 if (fh == null) {
                     response.recycle();
-                    return false; /* is false */
+                    return mSuccess; /* is false */
                 }
                 byte[] record = makeSmsRecordData(status, pdu);
                 fh.updateEFLinearFixed(
                         IccConstants.EF_SMS,
                         index, record, null, response);
             }
-            waitForResult(updateRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to update by index");
+            }
         }
-        return (boolean) updateRequest.mResult;
+        return mSuccess;
     }
 
     /**
@@ -312,9 +329,9 @@ public class IccSmsInterfaceManager {
                 callingPackage) != AppOpsManager.MODE_ALLOWED) {
             return false;
         }
-        Request copyRequest = new Request();
-        synchronized (copyRequest) {
-            Message response = mHandler.obtainMessage(EVENT_UPDATE_DONE, copyRequest);
+        synchronized(mLock) {
+            mSuccess = false;
+            Message response = mHandler.obtainMessage(EVENT_UPDATE_DONE);
 
             //RIL_REQUEST_WRITE_SMS_TO_SIM vs RIL_REQUEST_CDMA_WRITE_SMS_TO_RUIM
             if (PhoneConstants.PHONE_TYPE_GSM == mPhone.getPhoneType()) {
@@ -324,9 +341,13 @@ public class IccSmsInterfaceManager {
                 mPhone.mCi.writeSmsToRuim(status, pdu, response);
             }
 
-            waitForResult(copyRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to update by index");
+            }
         }
-        return (boolean) copyRequest.mResult;
+        return mSuccess;
     }
 
     /**
@@ -348,21 +369,25 @@ public class IccSmsInterfaceManager {
                 callingPackage) != AppOpsManager.MODE_ALLOWED) {
             return new ArrayList<SmsRawData>();
         }
-        Request getRequest = new Request();
-        synchronized (getRequest) {
+        synchronized(mLock) {
 
             IccFileHandler fh = mPhone.getIccFileHandler();
             if (fh == null) {
                 loge("Cannot load Sms records. No icc card?");
-                return null;
+                mSms = null;
+                return mSms;
             }
 
-            Message response = mHandler.obtainMessage(EVENT_LOAD_DONE, getRequest);
+            Message response = mHandler.obtainMessage(EVENT_LOAD_DONE);
             fh.loadEFLinearFixedAll(IccConstants.EF_SMS, response);
 
-            waitForResult(getRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to load from the Icc");
+            }
         }
-        return (List<SmsRawData>) getRequest.mResult;
+        return mSms;
     }
 
     /**
@@ -864,13 +889,17 @@ public class IccSmsInterfaceManager {
             return null;
         }
         enforceNotOnHandlerThread("getSmscAddressFromIccEf");
-        Request getRequest = new Request();
-        synchronized (getRequest) {
-            Message response = mHandler.obtainMessage(EVENT_GET_SMSC_DONE, getRequest);
+        synchronized (mLock) {
+            mSmsc = null;
+            Message response = mHandler.obtainMessage(EVENT_GET_SMSC_DONE);
             mPhone.mCi.getSmscAddress(response);
-            waitForResult(getRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to read SMSC");
+            }
         }
-        return (String) getRequest.mResult;
+        return mSmsc;
     }
 
     /**
@@ -884,14 +913,17 @@ public class IccSmsInterfaceManager {
                 callingPackage, "setSmscAddressOnIccEf")) {
             return false;
         }
-        enforceNotOnHandlerThread("setSmscAddressOnIccEf");
-        Request setRequest = new Request();
-        synchronized (setRequest) {
-            Message response = mHandler.obtainMessage(EVENT_SET_SMSC_DONE, setRequest);
+        synchronized (mLock) {
+            mSuccess = false;
+            Message response = mHandler.obtainMessage(EVENT_SET_SMSC_DONE);
             mPhone.mCi.setSmscAddress(smsc, response);
-            waitForResult(setRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to write SMSC");
+            }
         }
-        return (boolean) setRequest.mResult;
+        return mSuccess;
     }
 
     public boolean enableCellBroadcast(int messageIdentifier, int ranType) {
@@ -1143,16 +1175,20 @@ public class IccSmsInterfaceManager {
             log("Calling setGsmBroadcastConfig with " + configs.length + " configurations");
         }
         enforceNotOnHandlerThread("setCellBroadcastConfig");
-        Request setRequest = new Request();
-        synchronized (setRequest) {
-            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_CONFIG_DONE, setRequest);
+        synchronized (mLock) {
+            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_CONFIG_DONE);
 
+            mSuccess = false;
             mPhone.mCi.setGsmBroadcastConfig(configs, response);
 
-            waitForResult(setRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to set cell broadcast config");
+            }
         }
 
-        return (boolean) setRequest.mResult;
+        return mSuccess;
     }
 
     private boolean setCellBroadcastActivation(boolean activate) {
@@ -1161,16 +1197,20 @@ public class IccSmsInterfaceManager {
         }
 
         enforceNotOnHandlerThread("setCellBroadcastConfig");
-        Request setRequest = new Request();
-        synchronized (setRequest) {
-            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_ACTIVATION_DONE,
-                    setRequest);
+        synchronized (mLock) {
+            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_ACTIVATION_DONE);
 
+            mSuccess = false;
             mPhone.mCi.setGsmBroadcastActivation(activate, response);
-            waitForResult(setRequest);
+
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to set cell broadcast activation");
+            }
         }
 
-        return (boolean) setRequest.mResult;
+        return mSuccess;
     }
 
     @UnsupportedAppUsage
@@ -1180,16 +1220,20 @@ public class IccSmsInterfaceManager {
         }
 
         enforceNotOnHandlerThread("setCdmaBroadcastConfig");
-        Request setRequest = new Request();
-        synchronized (setRequest) {
-            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_CONFIG_DONE, setRequest);
+        synchronized (mLock) {
+            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_CONFIG_DONE);
 
+            mSuccess = false;
             mPhone.mCi.setCdmaBroadcastConfig(configs, response);
 
-            waitForResult(setRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to set cdma broadcast config");
+            }
         }
 
-        return (boolean) setRequest.mResult;
+        return mSuccess;
     }
 
     private boolean setCdmaBroadcastActivation(boolean activate) {
@@ -1198,17 +1242,20 @@ public class IccSmsInterfaceManager {
         }
 
         enforceNotOnHandlerThread("setCdmaBroadcastActivation");
-        Request setRequest = new Request();
-        synchronized (setRequest) {
-            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_ACTIVATION_DONE,
-                    setRequest);
+        synchronized (mLock) {
+            Message response = mHandler.obtainMessage(EVENT_SET_BROADCAST_ACTIVATION_DONE);
 
+            mSuccess = false;
             mPhone.mCi.setCdmaBroadcastActivation(activate, response);
 
-            waitForResult(setRequest);
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                loge("interrupted while trying to set cdma broadcast activation");
+            }
         }
 
-        return (boolean) setRequest.mResult;
+        return mSuccess;
     }
 
     @UnsupportedAppUsage
@@ -1479,18 +1526,6 @@ public class IccSmsInterfaceManager {
     private String filterDestAddress(String destAddr) {
         String result = SmsNumberUtils.filterDestAddr(mContext, mPhone.getSubId(), destAddr);
         return result != null ? result : destAddr;
-    }
-
-    private void waitForResult(Request request) {
-        synchronized (request) {
-            while (!request.mStatus.get()) {
-                try {
-                    request.wait();
-                } catch (InterruptedException e) {
-                    log("Interrupted while waiting for result");
-                }
-            }
-        }
     }
 
     public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {

@@ -363,10 +363,6 @@ public class SubscriptionController extends ISub.Stub {
      * Should only be triggered once.
      */
     public void notifySubInfoReady() {
-        PhoneSwitcher phoneSwitcher = PhoneSwitcher.getInstance();
-        if (phoneSwitcher != null) {
-            phoneSwitcher.notifySubInfoReady();
-        }
         // broadcast default subId.
         sendDefaultChangedBroadcast(SubscriptionManager.getDefaultSubscriptionId());
     }
@@ -2286,7 +2282,7 @@ public class SubscriptionController extends ISub.Stub {
         mUiccAppsEnableChangeRegList.remove(handler);
     }
 
-    protected void notifyUiccAppsEnableChanged() {
+    private void notifyUiccAppsEnableChanged() {
         mUiccAppsEnableChangeRegList.notifyRegistrants();
     }
 
